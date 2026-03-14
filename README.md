@@ -1,86 +1,97 @@
+# Scrapers: Numbeo + Climate
 
-# Weather Atlas Climate Scraper
+В проекте два независимых скрапера:
 
-Скрипт собирает климатические данные городов с **weather-atlas.com** и сохраняет их в таблицу PostgreSQL `avg_climate`.
+1. `9_scraping_numbeo_stats.py` -> цены Numbeo -> `numbeo_city_costs`
+2. `10_scraping_climate.py` -> климат Weather Atlas -> `avg_climate`
+
+---
+
+## Numbeo (`9_scraping_numbeo_stats.py`)
 
 Источник городов:
 
-```
+```text
 data/geonameid.pkl
 ```
 
-Для каждого города формируется URL страницы климата, данные парсятся по месяцам и записываются в БД.
+Целевая таблица:
 
-Ключ таблицы:
-
-```
-PRIMARY KEY (city_id, month)
+```text
+numbeo_city_costs (PRIMARY KEY: geoname_id, param_id)
 ```
 
-Повторные запуски обновляют существующие записи.
+Логика работы:
 
----
+1. Читает города из `geonameid.pkl`.
+2. Перед скрапингом проверяет, есть ли уже данные по `geoname_id` в `numbeo_city_costs`.
+3. Если данные есть, город пропускается (`Skipped`).
+4. Если данных нет, город скрапится и пишется в БД через upsert.
+5. `--limit N` применяется к первым **N отсутствующим** в БД городам (а не к первым N строкам файла).
 
-# Результаты работы
+HTTP-поведение:
 
-После запуска создаются:
+1. `429` (rate limit) -> fail-fast (без долгого ожидания на этом городе).
+2. Ретраи выполняются только для `500/502/503/504`.
 
-```
-data/climate_links.pkl
-```
+Запуск:
 
-успешно найденные ссылки Weather Atlas
-
-```
-data/missing_climate_links.pkl
-```
-
-города, для которых ссылка не была определена автоматически
-
----
-
-# Ручные исправления
-
-Для некоторых городов требуется указать правильную ссылку в:
-
-```
-correct_urls.json
+```bash
+python 9_scraping_numbeo_stats.py --limit 15
+python 9_scraping_numbeo_stats.py
 ```
 
-пример:
+Логи:
 
-```json
-{
-  "162": "https://www.weather-atlas.com/en/belgium/ghent-climate"
-}
+```text
+data/logs_numbeo_city_costs.log
 ```
 
 ---
 
-# Запуск
+## Climate (`10_scraping_climate.py`)
 
-Полный запуск:
+Источник городов:
 
-```
-python scraping_climate.py
-```
-
-Повторный запуск только для проблемных городов:
-
-```
-python scraping_climate.py --retry-missing
+```text
+./2026_2/data/geonameid.pkl
 ```
 
-В этом режиме используются города из `missing_climate_links.pkl`.
+Целевая таблица:
+
+```text
+avg_climate (PRIMARY KEY: city_id, month)
+```
+
+Результаты запуска:
+
+```text
+./2026_2/data/climate_links.pkl
+./2026_2/data/missing_climate_links.pkl
+```
+
+Ручные корректировки ссылок:
+
+```text
+./2026_2/data/correct_urls.json
+```
+
+Запуск:
+
+```bash
+python 10_scraping_climate.py
+python 10_scraping_climate.py --retry-missing
+```
 
 ---
 
-# Требования
+## Зависимости
 
-```
+```text
 pandas
 requests
 beautifulsoup4
 psycopg2
 lxml
+python-dotenv
 ```

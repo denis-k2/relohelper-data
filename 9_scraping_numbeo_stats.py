@@ -25,9 +25,12 @@ load_dotenv()
 # =========================================================
 
 NUMBEO_LINKS_PICKLE_PATH = "./data/geonameid.pkl"
-LOG_FILE_PATH = "./data/logs_numbeo_stats.log"
+LOG_FILE_PATH = "./data/logs_numbeo_city_costs.log"
 DEFAULT_TIMEOUT = 30
-REQUEST_DELAY_SECONDS = 0.2
+REQUEST_DELAY_SECONDS = 10
+MAX_HTTP_RETRIES = 3
+RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
+RETRY_BACKOFF_SECONDS = 8.0
 
 # Numbeo may expose two imported-beer rows with the same visible label
 # "Imported Beer (0.33 Liter Bottle)". In practice, they represent two
@@ -49,6 +52,22 @@ SKIP_PARAMS = {
 SUMMARY_PARAM_NAMES = {
     "The estimated monthly costs for a family of four",
     "The estimated monthly costs for a single person",
+}
+
+# Category header rows that may appear in the parsed table body.
+# These are not real parameters and must be skipped silently.
+KNOWN_CATEGORY_ROWS = {
+    "Restaurants",
+    "Markets",
+    "Transportation",
+    "Utilities (Monthly)",
+    "Sports And Leisure",
+    "Childcare",
+    "Clothing And Shoes",
+    "Rent Per Month",
+    "Buy Apartment Price",
+    "Salaries And Financing",
+    "Summary",
 }
 
 
@@ -88,11 +107,46 @@ def build_session() -> requests.Session:
 
 
 def get_response_text(session: requests.Session, link: str) -> str:
-    """Fetch page HTML and fail loudly on HTTP errors."""
-    sleep(REQUEST_DELAY_SECONDS)
-    response = session.get(link, timeout=DEFAULT_TIMEOUT)
-    response.raise_for_status()
-    return response.text
+    """Fetch page HTML with retry/backoff for rate-limit and transient HTTP errors."""
+    for attempt in range(1, MAX_HTTP_RETRIES + 1):
+        sleep(REQUEST_DELAY_SECONDS)
+        response = session.get(link, timeout=DEFAULT_TIMEOUT)
+
+        if response.status_code < 400:
+            return response.text
+
+        # Fail fast on rate-limit so the pipeline can continue with other cities.
+        if response.status_code == 429:
+            response.raise_for_status()
+
+        if (
+            response.status_code in RETRYABLE_STATUS_CODES
+            and attempt < MAX_HTTP_RETRIES
+        ):
+            retry_after_raw = response.headers.get("Retry-After")
+            retry_after: Optional[float] = None
+            if retry_after_raw:
+                try:
+                    retry_after = float(retry_after_raw)
+                except ValueError:
+                    retry_after = None
+
+            backoff = RETRY_BACKOFF_SECONDS * attempt
+            wait_seconds = retry_after if retry_after is not None else backoff
+            logging.warning(
+                "Retrying HTTP %s for %s (attempt %s/%s, sleep %.1fs)",
+                response.status_code,
+                link,
+                attempt,
+                MAX_HTTP_RETRIES,
+                wait_seconds,
+            )
+            sleep(wait_seconds)
+            continue
+
+        response.raise_for_status()
+
+    raise RuntimeError(f"Exceeded HTTP retries for {link}")
 
 
 def get_soup(html: str) -> BeautifulSoup:
@@ -295,6 +349,15 @@ def connect_db(db_url: str) -> PgConnection:
     return psycopg2.connect(db_url)
 
 
+def city_costs_exist(cursor: PgCursor, geoname_id: int) -> bool:
+    """Check whether climate stats already exist for the given geoname_id."""
+    cursor.execute(
+        "SELECT 1 FROM numbeo_city_costs WHERE geoname_id = %s LIMIT 1",
+        (geoname_id,),
+    )
+    return cursor.fetchone() is not None
+
+
 def resolve_geoname_id(row: pd.Series) -> int:
     """Resolve geoname_id from DataFrame row."""
     if "geonameid" not in row.index:
@@ -375,7 +438,7 @@ def build_rows_for_insert(
     updated_date: date,
     updated_by: str,
 ) -> list[tuple]:
-    """Convert parsed table rows to insert tuples for numbeo_stat."""
+    """Convert parsed table rows to insert tuples for numbeo_city_costs."""
     rows_to_insert: list[tuple] = []
     imported_beer_033_count = 0
 
@@ -390,6 +453,8 @@ def build_rows_for_insert(
             continue
 
         if param_name in SKIP_PARAMS:
+            continue
+        if param_name in KNOWN_CATEGORY_ROWS:
             continue
 
         canonical_name = canonicalize_param_name(param_name)
@@ -433,13 +498,13 @@ def build_rows_for_insert(
     return rows_to_insert
 
 
-def insert_numbeo_stats(
+def insert_numbeo_city_costs(
     cursor: PgCursor,
     connection: PgConnection,
     rows_to_insert: Iterable[tuple],
 ) -> None:
     """
-    Insert a city batch into numbeo_stat.
+    Insert a city batch into numbeo_city_costs.
 
     Column naming follows the current project convention:
     last_update, updated_date, updated_by
@@ -504,13 +569,13 @@ def process_city(
     session: requests.Session,
     cursor: PgCursor,
     connection: PgConnection,
+    geoname_id: int,
     row: pd.Series,
     df_summary_empty: pd.DataFrame,
     updated_date: date,
     updated_by: str,
 ) -> bool:
     """Scrape one city page and write parsed Numbeo stats to DB."""
-    geoname_id = resolve_geoname_id(row)
     link = normalize_link(row.get("link"))
 
     try:
@@ -535,8 +600,13 @@ def process_city(
             updated_by=updated_by,
         )
 
-        insert_numbeo_stats(cursor, connection, rows_to_insert)
-        logging.info("geoname_id=%s parsed successfully: %s", geoname_id, link)
+        insert_numbeo_city_costs(cursor, connection, rows_to_insert)
+        logging.info(
+            "geoname_id=%s parsed successfully: %s (rows=%s)",
+            geoname_id,
+            link,
+            len(rows_to_insert),
+        )
         return True
 
     except requests.RequestException as ex:
@@ -563,7 +633,7 @@ def process_city(
         return False
 
 
-def scrape_numbeo_stats(limit: Optional[int] = None) -> None:
+def scrape_numbeo_city_costs(limit: Optional[int] = None) -> None:
     """End-to-end pipeline for scraping Numbeo city stats."""
     updated_by = getenv("DATA_ENGR")
     db_url = getenv("SQLALCHEMY_RELOHELPER_URL")
@@ -577,23 +647,39 @@ def scrape_numbeo_stats(limit: Optional[int] = None) -> None:
     setup_logging()
     start_time = time()
 
-    df = load_source_dataframe(limit=limit)
+    # Load full sorted source; --limit is applied only to cities
+    # that are not yet present in numbeo_city_costs.
+    df = load_source_dataframe(limit=None)
     df_summary_empty = create_df_summary_empty()
     session = build_session()
 
     connection: Optional[PgConnection] = None
     success_count = 0
     fail_count = 0
+    skipped_count = 0
+    processed_target_count = 0
 
     try:
         connection = connect_db(db_url)
         cursor = connection.cursor()
 
         for _, row in df.iterrows():
+            if limit is not None and processed_target_count >= limit:
+                break
+
+            geoname_id = resolve_geoname_id(row)
+            if city_costs_exist(cursor, geoname_id):
+                skipped_count += 1
+                logging.info("geoname_id=%s skipped (already exists)", geoname_id)
+                continue
+
+            processed_target_count += 1
+
             ok = process_city(
                 session=session,
                 cursor=cursor,
                 connection=connection,
+                geoname_id=geoname_id,
                 row=row,
                 df_summary_empty=df_summary_empty,
                 updated_date=updated_date,
@@ -608,10 +694,12 @@ def scrape_numbeo_stats(limit: Optional[int] = None) -> None:
         logging.info("Finished scraping in %.2f sec", elapsed)
         logging.info("Success cities: %s", success_count)
         logging.info("Failed cities: %s", fail_count)
+        logging.info("Skipped cities: %s", skipped_count)
 
         print("[INFO] Numbeo scraping finished.")
         print(f"[INFO] Success cities: {success_count}")
         print(f"[INFO] Failed cities: {fail_count}")
+        print(f"[INFO] Skipped cities: {skipped_count}")
         print(f"[INFO] Execution time: {elapsed:.2f} sec")
 
     except (Exception, Error) as error:
@@ -639,7 +727,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    scrape_numbeo_stats(limit=args.limit)
+    scrape_numbeo_city_costs(limit=args.limit)
 
 
 if __name__ == "__main__":
