@@ -324,12 +324,12 @@ def resolve_geoname_id(row: pd.Series) -> int:
 
 
 def get_param_id(cursor: PgCursor, param_name: str) -> Optional[int]:
-    """Resolve param_id by param text from numbeo_param table."""
+    """Resolve param_id by param text from numbeo_cost_params table."""
     if param_name in SPECIAL_PARAM_IDS:
         return SPECIAL_PARAM_IDS[param_name]
 
     cursor.execute(
-        "SELECT param_id FROM numbeo_param WHERE param = %s LIMIT 1",
+        "SELECT param_id FROM numbeo_cost_params WHERE param = %s LIMIT 1",
         (param_name,),
     )
     result = cursor.fetchone()
@@ -445,7 +445,7 @@ def insert_numbeo_stats(
     last_update, updated_date, updated_by
     """
     insert_sql = """
-        INSERT INTO numbeo_stat (
+        INSERT INTO numbeo_city_costs (
             geoname_id,
             param_id,
             cost,
