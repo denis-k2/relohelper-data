@@ -190,7 +190,12 @@ def parse_last_update(soup: BeautifulSoup) -> Optional[date]:
         for line in text.splitlines():
             if line.startswith("Last update:"):
                 raw = line.removeprefix("Last update:").strip()
-                return datetime.strptime(raw, "%B %Y").date()
+                for fmt in ("%d %B %Y", "%B %Y"):
+                    try:
+                        return datetime.strptime(raw, fmt).date()
+                    except ValueError:
+                        continue
+                return None
 
         return None
     except (AttributeError, ValueError):
