@@ -1,13 +1,15 @@
+import argparse
 import json
 import logging
 import random
 import re
 import time as time_module
+from collections.abc import Hashable
 from datetime import date
 from os import getenv
 from pathlib import Path
 from time import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import pandas as pd
 import psycopg2
@@ -361,7 +363,7 @@ def params_template_df(
     geonameid is the second column after city_id.
     """
     df_params_templ = pd.DataFrame(
-        index=months_dict.values(),
+        index=list(months_dict.values()),
         columns=columns_list,
         dtype=None,
     )
@@ -429,6 +431,52 @@ def build_city_climate_df(
 
 def connect_db(db_url: str) -> PgConnection:
     return psycopg2.connect(db_url)
+
+
+def get_str_cell(row: pd.Series, key: str) -> str:
+    value = row.get(key)
+    if not isinstance(value, str):
+        raise ValueError(f"Expected string in '{key}', got {type(value).__name__}")
+    text = value.strip()
+    if not text:
+        raise ValueError(f"Empty value in '{key}'")
+    return text
+
+
+def maybe_int_from_cell(value: object) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        if pd.isna(value):
+            return None
+        return int(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        return int(text)
+    return int(cast(Any, value))
+
+
+def normalize_city_id(index_value: Hashable) -> int:
+    if isinstance(index_value, bool):
+        raise ValueError(f"Invalid city_id index: {index_value!r}")
+    if isinstance(index_value, int):
+        return index_value
+    if isinstance(index_value, float):
+        if pd.isna(index_value):
+            raise ValueError("city_id index is NaN")
+        return int(index_value)
+    if isinstance(index_value, str):
+        text = index_value.strip()
+        if not text:
+            raise ValueError("city_id index is empty")
+        return int(text)
+    raise ValueError(f"Unsupported city_id index type: {type(index_value).__name__}")
 
 
 def ensure_base_columns(connection: PgConnection, cursor: PgCursor) -> None:
@@ -540,7 +588,8 @@ def prepare_links_dataframe(df_numbeo: pd.DataFrame) -> pd.DataFrame:
     if "city_id" not in df_links.columns:
         df_links = df_links.reset_index()
         if "city_id" not in df_links.columns:
-            df_links = df_links.rename(columns={df_links.columns[0]: "city_id"})
+            first_col = str(df_links.columns[0])
+            df_links = df_links.rename(columns={first_col: "city_id"})
 
     if "link" in df_links.columns and "numbeo_link" not in df_links.columns:
         df_links = df_links.rename(columns={"link": "numbeo_link"})
@@ -568,9 +617,11 @@ def save_links_outputs(df_links: pd.DataFrame) -> None:
     ]
 
     existing_columns = [col for col in links_columns if col in df_links.columns]
-    df_links[existing_columns].to_pickle(CLIMATE_LINKS_PICKLE_PATH)
+    df_links_export = cast(pd.DataFrame, df_links.loc[:, existing_columns].copy())
+    df_links_export.to_pickle(CLIMATE_LINKS_PICKLE_PATH)
 
-    df_missing = df_links[df_links["climate_status"] != "ok"][existing_columns].copy()
+    missing_mask = df_links["climate_status"] != "ok"
+    df_missing = cast(pd.DataFrame, df_links.loc[missing_mask, existing_columns].copy())
     df_missing.to_pickle(MISSING_CLIMATE_LINKS_PICKLE_PATH)
 
 
@@ -592,9 +643,9 @@ def scrape_city_with_fallbacks(
         climate_link_source
     """
     auto_url = construct_url(
-        country=row["country"],
+        country=get_str_cell(row, "country"),
         state=row.get("state_name"),
-        city=row["city"],
+        city=get_str_cell(row, "city"),
     )
 
     city_dict = scrap_city_dict(session, auto_url)
@@ -640,16 +691,34 @@ def bootstrap_schema_from_sample_city(
     return params_dict, months_dict, df_template
 
 
-def load_source_dataframe() -> pd.DataFrame:
+def load_source_dataframe(retry_missing: bool = False) -> pd.DataFrame:
     """
     Load city source dataframe and sort it for easier debugging.
+
+    If retry_missing=True, load only cities that are still missing
+    from the previous scraping run.
     """
-    df_numbeo = pd.read_pickle(NUMBEO_LINKS_PICKLE_PATH)
-    df_numbeo.sort_values("country", inplace=True)
-    return df_numbeo
+    raw = pd.read_pickle(NUMBEO_LINKS_PICKLE_PATH)
+    if not isinstance(raw, pd.DataFrame):
+        raise TypeError("Expected DataFrame in NUMBEO_LINKS_PICKLE_PATH pickle")
+    df_numbeo = cast(pd.DataFrame, raw.copy())
+
+    if retry_missing:
+        raw_missing = pd.read_pickle("./2026_2/data/missing_climate_links.pkl")
+        if not isinstance(raw_missing, pd.DataFrame):
+            raise TypeError("Expected DataFrame in missing_climate_links pickle")
+        df_missing = cast(pd.DataFrame, raw_missing.copy())
+        missing_ids = df_missing["city_id"].dropna().tolist()
+        mask = df_numbeo["city_id"].isin(missing_ids)
+        df_numbeo = cast(pd.DataFrame, df_numbeo.loc[mask].copy())
+
+    df_numbeo = cast(pd.DataFrame, df_numbeo.sort_values(by="country").copy())
+    return cast(pd.DataFrame, df_numbeo)
 
 
-def scrape_all_cities_to_db() -> None:
+def scrape_all_cities_to_db(
+    retry_missing: bool = False, limit: int | None = None
+) -> None:
     """
     Main end-to-end pipeline:
     - build session with metric cookie
@@ -673,7 +742,10 @@ def scrape_all_cities_to_db() -> None:
 
     session = build_weather_atlas_session()
     correct_urls = load_correct_urls()
-    df_numbeo = load_source_dataframe()
+    df_numbeo = load_source_dataframe(retry_missing=retry_missing)
+    if limit is not None:
+        logging.info(f"Processing only first {limit} cities (test mode)")
+        df_numbeo = df_numbeo.head(limit)
     df_links = prepare_links_dataframe(df_numbeo)
 
     connection: Optional[PgConnection] = None
@@ -693,7 +765,8 @@ def scrape_all_cities_to_db() -> None:
         success_count = 0
         fail_count = 0
 
-        for city_id, row in df_numbeo.iterrows():
+        for city_index, row in df_numbeo.iterrows():
+            city_id = normalize_city_id(city_index)
             city_dict, auto_url, used_url, link_source = scrape_city_with_fallbacks(
                 session=session,
                 city_id=city_id,
@@ -715,11 +788,7 @@ def scrape_all_cities_to_db() -> None:
                 continue
 
             try:
-                geonameid = row.get("geonameid")
-                if pd.isna(geonameid):
-                    geonameid = None
-                elif geonameid is not None:
-                    geonameid = int(geonameid)
+                geonameid = maybe_int_from_cell(row.get("geonameid"))
 
                 df_city = build_city_climate_df(
                     city_id=city_id,
@@ -784,5 +853,27 @@ def scrape_all_cities_to_db() -> None:
 # Entrypoint
 # =========================================================
 
+
+def main():
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--retry-missing",
+        action="store_true",
+        help="Scrape only cities listed in missing_climate_links.pkl",
+    )
+
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Process only first N cities (useful for testing)",
+    )
+
+    args = parser.parse_args()
+
+    scrape_all_cities_to_db(retry_missing=args.retry_missing, limit=args.limit)
+
+
 if __name__ == "__main__":
-    scrape_all_cities_to_db()
+    main()
