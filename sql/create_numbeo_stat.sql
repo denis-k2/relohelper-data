@@ -1,14 +1,16 @@
-CREATE TABLE numbeo_stat (
-    stat_id serial NOT NULL,
-    city_id integer NOT NULL,
+CREATE TABLE IF NOT EXISTS public.numbeo_stat (
+    geoname_id integer NOT NULL,
     param_id integer NOT NULL,
-    cost numeric(9,2),
+    cost numeric,
     range numrange,
     last_update date,
-    currency text NULL DEFAULT 'USD'::text,
     updated_date date,
     updated_by varchar(30),
-    CONSTRAINT PK_stat_id PRIMARY KEY ( stat_id ),
-    CONSTRAINT fk_city_id FOREIGN KEY ( city_id ) REFERENCES public.city ( city_id ),
-    CONSTRAINT fk_param_id FOREIGN KEY ( param_id ) REFERENCES public.numbeo_param ( param_id )
+    CONSTRAINT pk_numbeo_stat PRIMARY KEY (geoname_id, param_id),
+    CONSTRAINT fk_numbeo_stat_param_id
+        FOREIGN KEY (param_id)
+        REFERENCES public.numbeo_param (param_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_numbeo_stat_param_id
+    ON public.numbeo_stat (param_id);

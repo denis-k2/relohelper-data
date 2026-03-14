@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Hashable
 from datetime import date, datetime
 from io import StringIO
 from os import getenv
@@ -17,6 +16,7 @@ from dotenv import load_dotenv
 from psycopg2 import Error
 from psycopg2.extensions import connection as PgConnection
 from psycopg2.extensions import cursor as PgCursor
+from psycopg2.extras import NumericRange
 
 load_dotenv()
 
@@ -232,9 +232,9 @@ def parse_numeric_value(value: object) -> Optional[float]:
         return None
 
 
-def parse_range_value(value: object) -> Optional[str]:
+def parse_range_value(value: object) -> Optional[NumericRange]:
     """
-    Convert a Numbeo range like '5.00-8.00' to a normalized string '[5.0, 8.0]'.
+    Convert a Numbeo range like '5.00-8.00' to psycopg2 NumericRange.
     Returns None if conversion fails.
     """
     if value is None:
@@ -249,8 +249,9 @@ def parse_range_value(value: object) -> Optional[str]:
         return None
 
     try:
-        normalized = [float(parts[0]), float(parts[1])]
-        return str(normalized)
+        lower = float(parts[0])
+        upper = float(parts[1])
+        return NumericRange(lower, upper, bounds="[]")
     except ValueError:
         return None
 
@@ -294,42 +295,32 @@ def connect_db(db_url: str) -> PgConnection:
     return psycopg2.connect(db_url)
 
 
-def resolve_city_id(row_index: int, row: pd.Series) -> int:
-    """
-    Resolve city_id safely.
+def resolve_geoname_id(row: pd.Series) -> int:
+    """Resolve geoname_id from DataFrame row."""
+    if "geonameid" not in row.index:
+        raise KeyError("Column 'geonameid' is missing in source dataframe")
 
-    Prefer explicit 'city_id' column. Fall back to DataFrame index for backward
-    compatibility with older pickle files where city_id was stored as index.
-    """
-    if "city_id" in row.index:
-        city_id_value: object = row.get("city_id")
-        if isinstance(city_id_value, (pd.Series, pd.DataFrame)):
-            return int(row_index)
+    geoname_value: object = row.get("geonameid")
+    if isinstance(geoname_value, (pd.Series, pd.DataFrame)):
+        raise TypeError(f"Invalid geonameid type: {type(geoname_value).__name__}")
+    if geoname_value is None:
+        raise ValueError("geonameid is null")
+    if isinstance(geoname_value, bool):
+        raise ValueError(f"Invalid geonameid value: {geoname_value!r}")
+    if isinstance(geoname_value, int):
+        return geoname_value
+    if isinstance(geoname_value, float):
+        if pd.isna(geoname_value):
+            raise ValueError("geonameid is NaN")
+        return int(geoname_value)
+    if isinstance(geoname_value, str):
+        clean = geoname_value.strip()
+        if not clean:
+            raise ValueError("geonameid is empty")
+        return int(clean)
 
-        if city_id_value is None:
-            return int(row_index)
-
-        if isinstance(city_id_value, str):
-            clean = city_id_value.strip()
-            if clean:
-                return int(clean)
-            return int(row_index)
-
-        if isinstance(city_id_value, bool):
-            return int(row_index)
-
-        if isinstance(city_id_value, int):
-            return city_id_value
-
-        if isinstance(city_id_value, float):
-            if pd.isna(city_id_value):
-                return int(row_index)
-            return int(city_id_value)
-
-        # Last-resort conversion for scalar-like values (e.g. numpy numbers).
-        city_id_any: Any = city_id_value
-        return int(city_id_any)
-    return int(row_index)
+    geoname_any: Any = geoname_value
+    return int(geoname_any)
 
 
 def get_param_id(cursor: PgCursor, param_name: str) -> Optional[int]:
@@ -379,7 +370,7 @@ def normalize_link(value: object) -> str:
 def build_rows_for_insert(
     cursor: PgCursor,
     table: pd.DataFrame,
-    city_id: int,
+    geoname_id: int,
     last_update: Optional[date],
     updated_date: date,
     updated_by: str,
@@ -392,7 +383,9 @@ def build_rows_for_insert(
         param_name = normalize_param_name(row["Restaurants"])
         if param_name is None:
             logging.warning(
-                "Invalid param name for city_id=%s, row=%s", city_id, row.to_dict()
+                "Invalid param name for geoname_id=%s, row=%s",
+                geoname_id,
+                row.to_dict(),
             )
             continue
 
@@ -408,8 +401,8 @@ def build_rows_for_insert(
                 param_id = 26
             else:
                 logging.warning(
-                    "Unexpected duplicate imported beer rows for city_id=%s, param=%s, count=%s",
-                    city_id,
+                    "Unexpected duplicate imported beer rows for geoname_id=%s, param=%s, count=%s",
+                    geoname_id,
                     param_name,
                     imported_beer_033_count,
                 )
@@ -419,15 +412,15 @@ def build_rows_for_insert(
 
         if param_id is None:
             logging.warning(
-                "param_id not found for city_id=%s, param=%s",
-                city_id,
+                "param_id not found for geoname_id=%s, param=%s",
+                geoname_id,
                 param_name,
             )
             continue
 
         rows_to_insert.append(
             (
-                city_id,
+                geoname_id,
                 param_id,
                 row["Edit"],
                 row["Range"],
@@ -453,7 +446,7 @@ def insert_numbeo_stats(
     """
     insert_sql = """
         INSERT INTO numbeo_stat (
-            city_id,
+            geoname_id,
             param_id,
             cost,
             range,
@@ -462,7 +455,7 @@ def insert_numbeo_stats(
             updated_by
         )
         VALUES (%s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (city_id, param_id)
+        ON CONFLICT (geoname_id, param_id)
         DO UPDATE SET
             cost = EXCLUDED.cost,
             range = EXCLUDED.range,
@@ -502,22 +495,6 @@ def load_source_dataframe(limit: Optional[int] = None) -> pd.DataFrame:
     return df
 
 
-def normalize_row_index(row_index: Hashable) -> int:
-    """Convert DataFrame index value to int for legacy city_id fallback."""
-    if isinstance(row_index, bool):
-        raise TypeError(f"Boolean row index is not supported: {row_index!r}")
-    if isinstance(row_index, int):
-        return row_index
-    if isinstance(row_index, str):
-        return int(row_index.strip())
-    if isinstance(row_index, float):
-        if pd.isna(row_index):
-            raise TypeError("NaN row index is not supported")
-        return int(row_index)
-
-    raise TypeError(f"Unsupported row index type: {type(row_index).__name__}")
-
-
 # =========================================================
 # Main pipeline
 # =========================================================
@@ -527,14 +504,13 @@ def process_city(
     session: requests.Session,
     cursor: PgCursor,
     connection: PgConnection,
-    row_index: int,
     row: pd.Series,
     df_summary_empty: pd.DataFrame,
     updated_date: date,
     updated_by: str,
 ) -> bool:
     """Scrape one city page and write parsed Numbeo stats to DB."""
-    city_id = resolve_city_id(row_index, row)
+    geoname_id = resolve_geoname_id(row)
     link = normalize_link(row.get("link"))
 
     try:
@@ -553,31 +529,33 @@ def process_city(
         rows_to_insert = build_rows_for_insert(
             cursor=cursor,
             table=df_main_table,
-            city_id=city_id,
+            geoname_id=geoname_id,
             last_update=last_update,
             updated_date=updated_date,
             updated_by=updated_by,
         )
 
         insert_numbeo_stats(cursor, connection, rows_to_insert)
-        logging.info("city_id=%s parsed successfully: %s", city_id, link)
+        logging.info("geoname_id=%s parsed successfully: %s", geoname_id, link)
         return True
 
     except requests.RequestException as ex:
         connection.rollback()
-        logging.exception("HTTP error for city_id=%s, link=%s: %s", city_id, link, ex)
+        logging.exception(
+            "HTTP error for geoname_id=%s, link=%s: %s", geoname_id, link, ex
+        )
         return False
     except (ValueError, KeyError, IndexError) as ex:
         connection.rollback()
         logging.exception(
-            "Parsing error for city_id=%s, link=%s: %s", city_id, link, ex
+            "Parsing error for geoname_id=%s, link=%s: %s", geoname_id, link, ex
         )
         return False
     except Exception as ex:
         connection.rollback()
         logging.exception(
-            "Unexpected error for city_id=%s, link=%s, error_type=%s: %s",
-            city_id,
+            "Unexpected error for geoname_id=%s, link=%s, error_type=%s: %s",
+            geoname_id,
             link,
             type(ex).__name__,
             ex,
@@ -611,13 +589,11 @@ def scrape_numbeo_stats(limit: Optional[int] = None) -> None:
         connection = connect_db(db_url)
         cursor = connection.cursor()
 
-        for row_index, row in df.iterrows():
-            row_index_int = normalize_row_index(row_index)
+        for _, row in df.iterrows():
             ok = process_city(
                 session=session,
                 cursor=cursor,
                 connection=connection,
-                row_index=row_index_int,
                 row=row,
                 df_summary_empty=df_summary_empty,
                 updated_date=updated_date,
