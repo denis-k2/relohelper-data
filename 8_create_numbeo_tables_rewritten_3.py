@@ -21,6 +21,7 @@ NUMBEO_SAMPLE_URL = (
 DEFAULT_TIMEOUT = 30
 REQUEST_DELAY_SECONDS = 0.2
 LOG_FILE_PATH = "./data/logs_create_numbeo_tables.log"
+SQL_DIR = Path(__file__).resolve().parent / "sql"
 
 SUMMARY_PARAMS = [
     "The estimated monthly costs for a family of four",
@@ -120,8 +121,8 @@ def build_aux_table(main_table: pd.DataFrame) -> pd.DataFrame:
     cleaned_rows = []
 
     for _, row in table.iterrows():
-        param_name = row["Restaurants"]
-        edit_value = row["Edit"]
+        param_name = normalize_text_cell(row.get("Restaurants"))
+        edit_value = normalize_text_cell(row.get("Edit"))
 
         if edit_value == "Edit":
             current_category = param_name
@@ -163,13 +164,13 @@ def extract_param_rows(aux_table: pd.DataFrame) -> list[tuple[str, str]]:
     rows: list[tuple[str, str]] = []
 
     for _, row in aux_table.iterrows():
-        category = row["categories"]
-        param = row["Restaurants"]
+        category = normalize_text_cell(row.get("categories"))
+        param = normalize_text_cell(row.get("Restaurants"))
 
-        if pd.isna(category) or pd.isna(param):
+        if category is None or param is None:
             continue
 
-        rows.append((str(category), str(param)))
+        rows.append((category, param))
 
     for param in SUMMARY_PARAMS:
         rows.append(("Summary", param))
@@ -186,25 +187,44 @@ def connect_db(db_url: str) -> PgConnection:
     return psycopg2.connect(db_url)
 
 
+def normalize_text_cell(value: object) -> Optional[str]:
+    """Convert table cell to plain text value or None."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value.strip()
+        return text if text else None
+    if isinstance(value, (pd.Series, pd.DataFrame)):
+        return None
+    if isinstance(value, float) and pd.isna(value):
+        return None
+
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return None
+    return text
+
+
+def execute_sql_file(cursor: PgCursor, filename: str) -> None:
+    """Execute one SQL file from project sql directory."""
+    sql_file = SQL_DIR / filename
+    cursor.execute(sql_file.read_text(encoding="utf-8"))
+
+
 def create_numbeo_cost_categories_table(
     cursor: PgCursor, connection: PgConnection
 ) -> None:
-    sql_file = (
-        Path(__file__).resolve().parent / "sql" / "create_numbeo_cost_categories.sql"
-    )
-    cursor.execute(sql_file.read_text(encoding="utf-8"))
+    execute_sql_file(cursor, "create_numbeo_cost_categories.sql")
     connection.commit()
 
 
 def create_numbeo_cost_params_table(cursor: PgCursor, connection: PgConnection) -> None:
-    sql_file = Path(__file__).resolve().parent / "sql" / "create_numbeo_cost_params.sql"
-    cursor.execute(sql_file.read_text(encoding="utf-8"))
+    execute_sql_file(cursor, "create_numbeo_cost_params.sql")
     connection.commit()
 
 
 def create_numbeo_stat_table(cursor: PgCursor, connection: PgConnection) -> None:
-    sql_file = Path(__file__).resolve().parent / "sql" / "create_numbeo_city_costs.sql"
-    cursor.execute(sql_file.read_text(encoding="utf-8"))
+    execute_sql_file(cursor, "create_numbeo_city_costs.sql")
     connection.commit()
 
 
@@ -230,18 +250,15 @@ def insert_params(
     connection: PgConnection,
     param_rows: list[tuple[str, str]],
 ) -> None:
-    for category, param in param_rows:
-        cursor.execute(
-            """
-            INSERT INTO public.numbeo_cost_params (category_id, param)
-            VALUES (
-                (SELECT category_id FROM public.numbeo_cost_categories WHERE category = %s),
-                %s
-            )
-            ON CONFLICT (category_id, param) DO NOTHING
-            """,
-            (category, param),
+    insert_sql = """
+        INSERT INTO public.numbeo_cost_params (category_id, param)
+        VALUES (
+            (SELECT category_id FROM public.numbeo_cost_categories WHERE category = %s),
+            %s
         )
+        ON CONFLICT (category_id, param) DO NOTHING
+    """
+    cursor.executemany(insert_sql, param_rows)
     connection.commit()
 
 
