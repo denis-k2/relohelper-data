@@ -1,8 +1,9 @@
 import logging
+from io import StringIO
 from os import getenv
+from pathlib import Path
 from time import sleep
 from typing import Optional
-from io import StringIO
 
 import pandas as pd
 import psycopg2
@@ -14,7 +15,9 @@ from psycopg2.extensions import cursor as PgCursor
 
 load_dotenv()
 
-NUMBEO_SAMPLE_URL = "https://www.numbeo.com/cost-of-living/in/New-York?displayCurrency=USD"
+NUMBEO_SAMPLE_URL = (
+    "https://www.numbeo.com/cost-of-living/in/New-York?displayCurrency=USD"
+)
 DEFAULT_TIMEOUT = 30
 REQUEST_DELAY_SECONDS = 0.2
 LOG_FILE_PATH = "./data/logs_create_numbeo_tables.log"
@@ -45,8 +48,7 @@ def build_session() -> requests.Session:
     session.headers.update(
         {
             "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) "
-                "Gecko/20100101 Firefox/148.0"
+                "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
             ),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
@@ -54,7 +56,6 @@ def build_session() -> requests.Session:
         }
     )
     return session
-
 
 
 def fetch_html(session: requests.Session, url: str) -> str:
@@ -82,8 +83,7 @@ def find_main_numbeo_table(html: str) -> pd.DataFrame:
         tables = pd.read_html(StringIO(html))
     except ValueError as ex:
         raise ValueError(
-            f"pd.read_html could not parse any tables. "
-            f"HTML preview: {html[:500]!r}"
+            f"pd.read_html could not parse any tables. HTML preview: {html[:500]!r}"
         ) from ex
 
     print(f"[INFO] Tables found on sample page: {len(tables)}")
@@ -139,7 +139,6 @@ def build_aux_table(main_table: pd.DataFrame) -> pd.DataFrame:
     return result.reset_index(drop=True)
 
 
-
 def extract_categories(aux_table: pd.DataFrame) -> list[str]:
     """Get unique category names in original order."""
     categories = []
@@ -152,7 +151,6 @@ def extract_categories(aux_table: pd.DataFrame) -> list[str]:
         categories.append("Summary")
 
     return categories
-
 
 
 def extract_param_rows(aux_table: pd.DataFrame) -> list[tuple[str, str]]:
@@ -188,62 +186,26 @@ def connect_db(db_url: str) -> PgConnection:
     return psycopg2.connect(db_url)
 
 
-
-def create_numbeo_category_table(cursor: PgCursor, connection: PgConnection) -> None:
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS public.numbeo_category (
-            category_id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            category varchar(100) NOT NULL UNIQUE
-        )
-        """
+def create_numbeo_cost_categories_table(
+    cursor: PgCursor, connection: PgConnection
+) -> None:
+    sql_file = (
+        Path(__file__).resolve().parent / "sql" / "create_numbeo_cost_categories.sql"
     )
+    cursor.execute(sql_file.read_text(encoding="utf-8"))
     connection.commit()
 
 
-
-def create_numbeo_param_table(cursor: PgCursor, connection: PgConnection) -> None:
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS public.numbeo_param (
-            param_id integer GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-            category_id integer NOT NULL,
-            param varchar(255) NOT NULL,
-            CONSTRAINT fk_numbeo_param_category_id
-                FOREIGN KEY (category_id)
-                REFERENCES public.numbeo_category (category_id),
-            CONSTRAINT uq_numbeo_param_category_param
-                UNIQUE (category_id, param)
-        )
-        """
-    )
+def create_numbeo_cost_params_table(cursor: PgCursor, connection: PgConnection) -> None:
+    sql_file = Path(__file__).resolve().parent / "sql" / "create_numbeo_cost_params.sql"
+    cursor.execute(sql_file.read_text(encoding="utf-8"))
     connection.commit()
-
 
 
 def create_numbeo_stat_table(cursor: PgCursor, connection: PgConnection) -> None:
-    cursor.execute(
-        """
-        CREATE TABLE IF NOT EXISTS public.numbeo_stat (
-            city_id integer NOT NULL,
-            param_id integer NOT NULL,
-            cost numeric,
-            range varchar(50),
-            last_update date,
-            updated_date date,
-            updated_by varchar(30),
-            CONSTRAINT pk_numbeo_stat PRIMARY KEY (city_id, param_id),
-            CONSTRAINT fk_numbeo_stat_city_id
-                FOREIGN KEY (city_id)
-                REFERENCES public.cities (city_id),
-            CONSTRAINT fk_numbeo_stat_param_id
-                FOREIGN KEY (param_id)
-                REFERENCES public.numbeo_param (param_id)
-        )
-        """
-    )
+    sql_file = Path(__file__).resolve().parent / "sql" / "create_numbeo_city_costs.sql"
+    cursor.execute(sql_file.read_text(encoding="utf-8"))
     connection.commit()
-
 
 
 def insert_categories(
@@ -254,14 +216,13 @@ def insert_categories(
     for category in categories:
         cursor.execute(
             """
-            INSERT INTO public.numbeo_category (category)
+            INSERT INTO public.numbeo_cost_categories (category)
             VALUES (%s)
             ON CONFLICT (category) DO NOTHING
             """,
             (category,),
         )
     connection.commit()
-
 
 
 def insert_params(
@@ -272,9 +233,9 @@ def insert_params(
     for category, param in param_rows:
         cursor.execute(
             """
-            INSERT INTO public.numbeo_param (category_id, param)
+            INSERT INTO public.numbeo_cost_params (category_id, param)
             VALUES (
-                (SELECT category_id FROM public.numbeo_category WHERE category = %s),
+                (SELECT category_id FROM public.numbeo_cost_categories WHERE category = %s),
                 %s
             )
             ON CONFLICT (category_id, param) DO NOTHING
@@ -303,8 +264,8 @@ def create_numbeo_tables() -> None:
         connection = connect_db(db_url)
         cursor = connection.cursor()
 
-        create_numbeo_category_table(cursor, connection)
-        create_numbeo_param_table(cursor, connection)
+        create_numbeo_cost_categories_table(cursor, connection)
+        create_numbeo_cost_params_table(cursor, connection)
         create_numbeo_stat_table(cursor, connection)
 
         html = fetch_html(session, NUMBEO_SAMPLE_URL)
