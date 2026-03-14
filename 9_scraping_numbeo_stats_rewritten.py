@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import argparse
 import logging
+from collections.abc import Hashable
 from datetime import date, datetime
 from io import StringIO
 from os import getenv
 from time import sleep, time
-from typing import Iterable, Optional
+from typing import Any, Iterable, Optional
 
 import pandas as pd
 import psycopg2
@@ -294,8 +295,34 @@ def resolve_city_id(row_index: int, row: pd.Series) -> int:
     Prefer explicit 'city_id' column. Fall back to DataFrame index for backward
     compatibility with older pickle files where city_id was stored as index.
     """
-    if "city_id" in row.index and pd.notna(row["city_id"]):
-        return int(row["city_id"])
+    if "city_id" in row.index:
+        city_id_value: object = row.get("city_id")
+        if isinstance(city_id_value, (pd.Series, pd.DataFrame)):
+            return int(row_index)
+
+        if city_id_value is None:
+            return int(row_index)
+
+        if isinstance(city_id_value, str):
+            clean = city_id_value.strip()
+            if clean:
+                return int(clean)
+            return int(row_index)
+
+        if isinstance(city_id_value, bool):
+            return int(row_index)
+
+        if isinstance(city_id_value, int):
+            return city_id_value
+
+        if isinstance(city_id_value, float):
+            if pd.isna(city_id_value):
+                return int(row_index)
+            return int(city_id_value)
+
+        # Last-resort conversion for scalar-like values (e.g. numpy numbers).
+        city_id_any: Any = city_id_value
+        return int(city_id_any)
     return int(row_index)
 
 
@@ -316,8 +343,10 @@ def normalize_param_name(value: object) -> Optional[str]:
     """Convert a raw table cell to a valid param name or return None."""
     if value is None:
         return None
-    if pd.isna(value):
+
+    if isinstance(value, float) and pd.isna(value):
         return None
+
     if not isinstance(value, str):
         return None
 
@@ -325,6 +354,15 @@ def normalize_param_name(value: object) -> Optional[str]:
     if not name or name.lower() in {"nan", "none"}:
         return None
     return name
+
+
+def normalize_link(value: object) -> str:
+    """Convert DataFrame link cell to a non-empty URL string."""
+    if isinstance(value, str):
+        link = value.strip()
+        if link:
+            return link
+    raise ValueError(f"Invalid link value: {value!r}")
 
 
 def build_rows_for_insert(
@@ -419,15 +457,36 @@ def insert_numbeo_stats(
 
 def load_source_dataframe(limit: Optional[int] = None) -> pd.DataFrame:
     """Load source DataFrame from pickle and optionally limit row count."""
-    df = pd.read_pickle(NUMBEO_LINKS_PICKLE_PATH)
+    raw: Any = pd.read_pickle(NUMBEO_LINKS_PICKLE_PATH)
+    if not isinstance(raw, pd.DataFrame):
+        raise TypeError(
+            f"Expected DataFrame in pickle, got {type(raw).__name__}: {NUMBEO_LINKS_PICKLE_PATH}"
+        )
+    df = raw.copy()
 
     if "country" in df.columns:
-        df = df.sort_values("country").copy()
+        df = df.sort_values(by=["country"]).copy()
 
     if limit is not None:
         df = df.head(limit).copy()
 
     return df
+
+
+def normalize_row_index(row_index: Hashable) -> int:
+    """Convert DataFrame index value to int for legacy city_id fallback."""
+    if isinstance(row_index, bool):
+        raise TypeError(f"Boolean row index is not supported: {row_index!r}")
+    if isinstance(row_index, int):
+        return row_index
+    if isinstance(row_index, str):
+        return int(row_index.strip())
+    if isinstance(row_index, float):
+        if pd.isna(row_index):
+            raise TypeError("NaN row index is not supported")
+        return int(row_index)
+
+    raise TypeError(f"Unsupported row index type: {type(row_index).__name__}")
 
 
 # =========================================================
@@ -447,7 +506,7 @@ def process_city(
 ) -> bool:
     """Scrape one city page and write parsed Numbeo stats to DB."""
     city_id = resolve_city_id(row_index, row)
-    link = row["link"]
+    link = normalize_link(row.get("link"))
 
     try:
         html = get_response_text(session, link)
@@ -524,11 +583,12 @@ def scrape_numbeo_stats(limit: Optional[int] = None) -> None:
         cursor = connection.cursor()
 
         for row_index, row in df.iterrows():
+            row_index_int = normalize_row_index(row_index)
             ok = process_city(
                 session=session,
                 cursor=cursor,
                 connection=connection,
-                row_index=row_index,
+                row_index=row_index_int,
                 row=row,
                 df_summary_empty=df_summary_empty,
                 updated_date=updated_date,
