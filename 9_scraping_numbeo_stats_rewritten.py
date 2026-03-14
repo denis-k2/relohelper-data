@@ -47,8 +47,8 @@ SKIP_PARAMS = {
 }
 
 SUMMARY_PARAM_NAMES = {
-    "Family of four estimated monthly costs (without rent)",
-    "A single person estimated monthly costs (without rent)",
+    "The estimated monthly costs for a family of four",
+    "The estimated monthly costs for a single person",
 }
 
 
@@ -110,8 +110,8 @@ def create_df_summary_empty() -> pd.DataFrame:
         {
             "Restaurants": [
                 "Summary",
-                "Family of four estimated monthly costs (without rent)",
-                "A single person estimated monthly costs (without rent)",
+                "The estimated monthly costs for a family of four",
+                "The estimated monthly costs for a single person",
             ],
             "Edit": ["Edit", None, None],
             "Range": [None, None, None],

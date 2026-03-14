@@ -20,8 +20,8 @@ REQUEST_DELAY_SECONDS = 0.2
 LOG_FILE_PATH = "./data/logs_create_numbeo_tables.log"
 
 SUMMARY_PARAMS = [
-    "Family of four estimated monthly costs (without rent)",
-    "A single person estimated monthly costs (without rent)",
+    "The estimated monthly costs for a family of four",
+    "The estimated monthly costs for a single person",
 ]
 
 
