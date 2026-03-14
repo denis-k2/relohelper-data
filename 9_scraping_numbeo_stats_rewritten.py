@@ -29,12 +29,13 @@ LOG_FILE_PATH = "./data/logs_numbeo_stats.log"
 DEFAULT_TIMEOUT = 30
 REQUEST_DELAY_SECONDS = 0.2
 
-# Numbeo contains duplicated parameter names for imported beer.
-# They must be mapped explicitly because a plain subquery by param name
-# would be ambiguous.
+# Numbeo may expose two imported-beer rows with the same visible label
+# "Imported Beer (0.33 Liter Bottle)". In practice, they represent two
+# different params in DB and must be disambiguated by occurrence order.
+IMPORTED_BEER_033_LABEL = "Imported Beer (0.33 Liter Bottle)"
+IMPORTED_BEER_05_LABEL = "Imported Beer (0.5 Liter Bottle)"
 SPECIAL_PARAM_IDS = {
-    "Imported Beer (0.33 liter bottle)": 5,
-    "Imported Beer (0.5 liter bottle)": 26,
+    IMPORTED_BEER_05_LABEL: 26,
 }
 
 SKIP_PARAMS = {
@@ -356,6 +357,11 @@ def normalize_param_name(value: object) -> Optional[str]:
     return name
 
 
+def canonicalize_param_name(value: str) -> str:
+    """Normalize param name for case-insensitive comparisons."""
+    return " ".join(value.strip().split()).lower()
+
+
 def normalize_link(value: object) -> str:
     """Convert DataFrame link cell to a non-empty URL string."""
     if isinstance(value, str):
@@ -375,6 +381,7 @@ def build_rows_for_insert(
 ) -> list[tuple]:
     """Convert parsed table rows to insert tuples for numbeo_stat."""
     rows_to_insert: list[tuple] = []
+    imported_beer_033_count = 0
 
     for _, row in table.iterrows():
         param_name = normalize_param_name(row["Restaurants"])
@@ -387,7 +394,24 @@ def build_rows_for_insert(
         if param_name in SKIP_PARAMS:
             continue
 
-        param_id = get_param_id(cursor, param_name)
+        canonical_name = canonicalize_param_name(param_name)
+        if canonical_name == canonicalize_param_name(IMPORTED_BEER_033_LABEL):
+            imported_beer_033_count += 1
+            if imported_beer_033_count == 1:
+                param_id = 5
+            elif imported_beer_033_count == 2:
+                param_id = 26
+            else:
+                logging.warning(
+                    "Unexpected duplicate imported beer rows for city_id=%s, param=%s, count=%s",
+                    city_id,
+                    param_name,
+                    imported_beer_033_count,
+                )
+                continue
+        else:
+            param_id = get_param_id(cursor, param_name)
+
         if param_id is None:
             logging.warning(
                 "param_id not found for city_id=%s, param=%s",
