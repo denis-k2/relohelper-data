@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import random
 from datetime import date, datetime
 from io import StringIO
 from os import getenv
@@ -27,7 +28,8 @@ load_dotenv()
 NUMBEO_LINKS_PICKLE_PATH = "./data/geonameid.pkl"
 LOG_FILE_PATH = "./data/logs_numbeo_city_costs.log"
 DEFAULT_TIMEOUT = 30
-REQUEST_DELAY_SECONDS = 10
+REQUEST_DELAY_MIN_SECONDS = 20
+REQUEST_DELAY_MAX_SECONDS = 70
 MAX_HTTP_RETRIES = 3
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 RETRY_BACKOFF_SECONDS = 8.0
@@ -98,6 +100,12 @@ def build_session() -> requests.Session:
             "User-Agent": (
                 "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0"
             ),
+            # Chrome example:
+            # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            # "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            # Edge example:
+            # "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            # "(KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36 Edg/134.0.0.0",
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Referer": "https://www.numbeo.com/",
@@ -109,7 +117,7 @@ def build_session() -> requests.Session:
 def get_response_text(session: requests.Session, link: str) -> str:
     """Fetch page HTML with retry/backoff for rate-limit and transient HTTP errors."""
     for attempt in range(1, MAX_HTTP_RETRIES + 1):
-        sleep(REQUEST_DELAY_SECONDS)
+        sleep(random.uniform(REQUEST_DELAY_MIN_SECONDS, REQUEST_DELAY_MAX_SECONDS))
         response = session.get(link, timeout=DEFAULT_TIMEOUT)
 
         if response.status_code < 400:
@@ -483,12 +491,20 @@ def build_rows_for_insert(
             )
             continue
 
+        cost_value = row["Edit"]
+        if isinstance(cost_value, float) and pd.isna(cost_value):
+            cost_value = None
+
+        range_value = row["Range"]
+        if isinstance(range_value, float) and pd.isna(range_value):
+            range_value = None
+
         rows_to_insert.append(
             (
                 geoname_id,
                 param_id,
-                row["Edit"],
-                row["Range"],
+                cost_value,
+                range_value,
                 last_update,
                 updated_date,
                 updated_by,
