@@ -27,10 +27,13 @@ load_dotenv()
 
 NUMBEO_LINKS_PICKLE_PATH = "./data/geonameid.pkl"
 LOG_FILE_PATH = "./data/logs_numbeo_city_costs.log"
-DEFAULT_TIMEOUT = 30
-REQUEST_DELAY_MIN_SECONDS = 20
-REQUEST_DELAY_MAX_SECONDS = 70
+CONNECT_TIMEOUT_SECONDS = 10
+READ_TIMEOUT_SECONDS = 30
+READ_TIMEOUT_FALLBACK_SECONDS = 80
+REQUEST_DELAY_MIN_SECONDS = 5
+REQUEST_DELAY_MAX_SECONDS = 12
 MAX_HTTP_RETRIES = 3
+READ_TIMEOUT_RETRIES = 1
 RETRYABLE_STATUS_CODES = {500, 502, 503, 504}
 RETRY_BACKOFF_SECONDS = 8.0
 
@@ -70,6 +73,16 @@ KNOWN_CATEGORY_ROWS = {
     "Buy Apartment Price",
     "Salaries And Financing",
     "Summary",
+}
+
+# ReadTimeouts seen in current log snapshot (kept as notes for manual retries):
+# 3067696 https://www.numbeo.com/cost-of-living/in/Prague?displayCurrency=USD
+# 2988507 https://www.numbeo.com/cost-of-living/in/Paris?displayCurrency=USD
+# 3173435 https://www.numbeo.com/cost-of-living/in/Milan?displayCurrency=USD
+READ_TIMEOUT_SKIP_GEONAME_IDS = {
+    3067696,  # Prague
+    2988507,  # Paris
+    3173435,  # Milan
 }
 
 
@@ -116,9 +129,42 @@ def build_session() -> requests.Session:
 
 def get_response_text(session: requests.Session, link: str) -> str:
     """Fetch page HTML with retry/backoff for rate-limit and transient HTTP errors."""
+    read_timeout_attempts = 0
+
     for attempt in range(1, MAX_HTTP_RETRIES + 1):
         sleep(random.uniform(REQUEST_DELAY_MIN_SECONDS, REQUEST_DELAY_MAX_SECONDS))
-        response = session.get(link, timeout=DEFAULT_TIMEOUT)
+        try:
+            response = session.get(
+                link, timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_SECONDS)
+            )
+        except requests.ReadTimeout:
+            read_timeout_attempts += 1
+            try:
+                fallback_headers = dict(session.headers)
+                fallback_headers["Connection"] = "close"
+                fallback_response = requests.get(
+                    link,
+                    headers=fallback_headers,
+                    timeout=(CONNECT_TIMEOUT_SECONDS, READ_TIMEOUT_FALLBACK_SECONDS),
+                )
+                if fallback_response.status_code < 400:
+                    return fallback_response.text
+                fallback_response.raise_for_status()
+            except requests.RequestException:
+                pass
+
+            if read_timeout_attempts <= READ_TIMEOUT_RETRIES:
+                wait_seconds = RETRY_BACKOFF_SECONDS * read_timeout_attempts
+                logging.warning(
+                    "ReadTimeout for %s (retry %s/%s, sleep %.1fs)",
+                    link,
+                    read_timeout_attempts,
+                    READ_TIMEOUT_RETRIES,
+                    wait_seconds,
+                )
+                sleep(wait_seconds)
+                continue
+            raise
 
         if response.status_code < 400:
             return response.text
@@ -684,6 +730,14 @@ def scrape_numbeo_city_costs(limit: Optional[int] = None) -> None:
                 break
 
             geoname_id = resolve_geoname_id(row)
+            if geoname_id in READ_TIMEOUT_SKIP_GEONAME_IDS:
+                skipped_count += 1
+                logging.info(
+                    "geoname_id=%s skipped (manual retry list from ReadTimeout)",
+                    geoname_id,
+                )
+                continue
+
             if city_costs_exist(cursor, geoname_id):
                 skipped_count += 1
                 logging.info("geoname_id=%s skipped (already exists)", geoname_id)
