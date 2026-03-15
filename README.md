@@ -51,6 +51,21 @@ python 9_scraping_numbeo_stats.py
 data/logs_numbeo_city_costs.log
 ```
 
+###### Manual/offline режим (без запросов в интернет):
+
+1. Сохранить HTML-страницы в `data/manual_numbeo_html/` с именем файла = `geonameid` (например, `2643743.html`).
+2. Запустить:
+
+```bash
+python 9_scraping_numbeo_stats_manual.py
+```
+
+Лог manual-режима:
+
+```text
+data/logs_numbeo_city_costs_manual.log
+```
+
 ---
 
 ## Climate (`10_scraping_climate.py`)
