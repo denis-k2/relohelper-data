@@ -165,13 +165,17 @@ python 10_scraping_climate.py --retry-missing
 
 ---
 
-## Зависимости
+## Установка через uv
+
+В проекте используются:
 
 ```text
-pandas
-requests
-beautifulsoup4
-psycopg2
-lxml
-python-dotenv
+pyproject.toml
+uv.lock
+```
+
+Установка зависимостей:
+
+```bash
+uv sync
 ```
