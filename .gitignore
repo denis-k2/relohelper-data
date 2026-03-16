@@ -6,3 +6,4 @@ __pycache__/
 .2026_2
 data/*.log
 data/debug_html/
+data/manual_numbeo_html/
